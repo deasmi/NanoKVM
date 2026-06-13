@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
@@ -15,6 +16,7 @@ import (
 const (
 	virtualNetwork = "/boot/usb.rndis0"
 	virtualDisk    = "/boot/usb.disk0"
+	virtualSerial  = "/boot/usb.acm"
 )
 
 var (
@@ -50,10 +52,12 @@ func (s *Service) GetVirtualDevice(c *gin.Context) {
 
 	network, _ := isDeviceExist(virtualNetwork)
 	disk, _ := isDeviceExist(virtualDisk)
+	serial, _ := isDeviceExist(virtualSerial)
 
 	rsp.OkRspWithData(c, &proto.GetVirtualDeviceRsp{
 		Network: network,
 		Disk:    disk,
+		Serial:  serial,
 	})
 	log.Debugf("get virtual device success")
 }
@@ -64,6 +68,11 @@ func (s *Service) UpdateVirtualDevice(c *gin.Context) {
 
 	if err := proto.ParseFormRequest(c, &req); err != nil {
 		rsp.ErrRsp(c, -1, "invalid argument")
+		return
+	}
+
+	if req.Device == "serial" {
+		s.updateUsbSerial(c)
 		return
 	}
 
@@ -116,6 +125,55 @@ func (s *Service) UpdateVirtualDevice(c *gin.Context) {
 	})
 
 	log.Debugf("update virtual device %s success", req.Device)
+}
+
+// updateUsbSerial toggles the USB CDC ACM virtual serial port.
+//
+// Enabling implies HID-Only mode because adding the ACM endpoint to the
+// standard composite gadget exceeds the SG2002/dwc2 FIFO budget — only
+// keyboard + mouse + ACM fits. We therefore swap to the HID-only init
+// script when needed, write /boot/usb.acm, and reboot.
+//
+// Disabling removes the flag and reboots. HID-Only mode is left alone;
+// the user toggles it back to normal separately if they want
+// network/mass-storage back.
+func (s *Service) updateUsbSerial(c *gin.Context) {
+	var rsp proto.Response
+
+	exist, _ := isDeviceExist(virtualSerial)
+	enable := !exist
+
+	if enable {
+		// Always overwrite /etc/init.d/S03usbdev with the hid-only script.
+		// We can't use hid.SwitchMode here: its short-circuit relies on
+		// bcdDevice as the mode marker, and on some firmware the kernel
+		// default for bcdDevice already matches the hid-only marker, so
+		// SwitchMode incorrectly thinks no swap is needed.
+		if err := hid.CopyModeFile(hid.ModeHidOnlyScript); err != nil {
+			log.Errorf("failed to copy hid-only script: %s", err)
+			rsp.ErrRsp(c, -3, "operation failed")
+			return
+		}
+		if err := os.WriteFile(virtualSerial, []byte{}, 0o644); err != nil {
+			log.Errorf("failed to create %s: %s", virtualSerial, err)
+			rsp.ErrRsp(c, -3, "operation failed")
+			return
+		}
+	} else {
+		if err := os.Remove(virtualSerial); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Errorf("failed to remove %s: %s", virtualSerial, err)
+			rsp.ErrRsp(c, -3, "operation failed")
+			return
+		}
+	}
+
+	rsp.OkRspWithData(c, &proto.UpdateVirtualDeviceRsp{
+		On: enable,
+	})
+	log.Printf("usb serial %v, rebooting", enable)
+
+	time.Sleep(500 * time.Millisecond)
+	_ = exec.Command("reboot").Run()
 }
 
 func isDeviceExist(device string) (bool, error) {
